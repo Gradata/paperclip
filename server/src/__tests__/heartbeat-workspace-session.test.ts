@@ -3,10 +3,12 @@ import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
+  DEAD_REUSED_SESSION_FAILURE_THRESHOLD,
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
   deriveTaskKeyWithHeartbeatFallback,
+  detectDeadReusedSessionCircuitBreaker,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
@@ -540,6 +542,58 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
     expect(
       prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-9").map((row) => row.id),
     ).toEqual(["workspace-1", "workspace-2"]);
+  });
+});
+
+describe("dead reused session circuit breaker", () => {
+  function deadRun(id: string, sessionId = "dead-session") {
+    return {
+      id,
+      livenessState: "failed",
+      usageJson: {
+        persistedSessionId: sessionId,
+        sessionReused: true,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        rawInputTokens: 0,
+        rawCachedInputTokens: 0,
+        rawOutputTokens: 0,
+      },
+    };
+  }
+
+  it("rotates after three consecutive failed reused zero-token runs on the same persisted session", () => {
+    const decision = detectDeadReusedSessionCircuitBreaker({
+      sessionId: "dead-session",
+      runs: [deadRun("run-3"), deadRun("run-2"), deadRun("run-1")],
+    });
+
+    expect(decision.rotate).toBe(true);
+    expect(decision.reason).toContain(`${DEAD_REUSED_SESSION_FAILURE_THRESHOLD} consecutive failed zero-token reused runs`);
+    expect(decision.previousRunId).toBe("run-3");
+  });
+
+  it("does not rotate when progress breaks the consecutive dead-run streak", () => {
+    const decision = detectDeadReusedSessionCircuitBreaker({
+      sessionId: "dead-session",
+      runs: [
+        deadRun("run-3"),
+        {
+          ...deadRun("run-2"),
+          livenessState: "advanced",
+          usageJson: {
+            ...deadRun("run-2").usageJson,
+            inputTokens: 12,
+            outputTokens: 3,
+          },
+        },
+        deadRun("run-1"),
+      ],
+    });
+
+    expect(decision.rotate).toBe(false);
+    expect(decision.reason).toBeNull();
   });
 });
 

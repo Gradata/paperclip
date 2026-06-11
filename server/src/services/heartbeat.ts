@@ -236,6 +236,7 @@ const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
+export const DEAD_REUSED_SESSION_FAILURE_THRESHOLD = 3;
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -1493,6 +1494,53 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
     cachedInputTokens,
     outputTokens,
   };
+}
+
+type DeadReusedSessionRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "livenessState" | "usageJson">;
+
+function readUsageTokenCount(parsedUsage: Record<string, unknown>, rawKey: string, normalizedKey: string) {
+  return Math.max(0, Math.floor(asNumber(parsedUsage[rawKey], asNumber(parsedUsage[normalizedKey], 0))));
+}
+
+function isDeadReusedSessionRun(run: DeadReusedSessionRun, sessionId: string) {
+  if (run.livenessState !== "failed") return false;
+  const usage = parseObject(run.usageJson);
+  if (usage.sessionReused !== true) return false;
+  if (readNonEmptyString(usage.persistedSessionId) !== sessionId) return false;
+
+  const inputTokens = readUsageTokenCount(usage, "rawInputTokens", "inputTokens");
+  const cachedInputTokens = readUsageTokenCount(usage, "rawCachedInputTokens", "cachedInputTokens");
+  const outputTokens = readUsageTokenCount(usage, "rawOutputTokens", "outputTokens");
+  return inputTokens === 0 && cachedInputTokens === 0 && outputTokens === 0;
+}
+
+export function detectDeadReusedSessionCircuitBreaker(input: {
+  sessionId: string | null;
+  runs: DeadReusedSessionRun[];
+  threshold?: number;
+}) {
+  const sessionId = readNonEmptyString(input.sessionId);
+  const threshold = Math.max(1, Math.floor(input.threshold ?? DEAD_REUSED_SESSION_FAILURE_THRESHOLD));
+  if (!sessionId) {
+    return { rotate: false, reason: null as string | null, previousRunId: null as string | null };
+  }
+
+  let consecutive = 0;
+  let latestDeadRunId: string | null = null;
+  for (const run of input.runs) {
+    if (!isDeadReusedSessionRun(run, sessionId)) break;
+    consecutive += 1;
+    latestDeadRunId ??= run.id;
+    if (consecutive >= threshold) {
+      return {
+        rotate: true,
+        reason: `${threshold} consecutive failed zero-token reused runs on persisted session ${sessionId}`,
+        previousRunId: latestDeadRunId,
+      };
+    }
+  }
+
+  return { rotate: false, reason: null as string | null, previousRunId: latestDeadRunId };
 }
 
 function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: UsageTotals | null): UsageTotals | null {
@@ -3481,22 +3529,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const policy = parseSessionCompactionPolicy(agent);
-    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: null,
-      };
-    }
-
-    const fetchLimit = Math.max(policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0, 4);
+    const hasPolicyThresholds = policy.enabled && hasSessionCompactionThresholds(policy);
+    const fetchLimit = Math.max(
+      hasPolicyThresholds && policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0,
+      DEAD_REUSED_SESSION_FAILURE_THRESHOLD,
+      4,
+    );
     const runs = await db
       .select({
         id: heartbeatRuns.id,
         createdAt: heartbeatRuns.createdAt,
         usageJson: heartbeatRuns.usageJson,
         error: heartbeatRuns.error,
+        livenessState: heartbeatRuns.livenessState,
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)
@@ -3527,10 +3572,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
         : 0;
 
-    let reason: string | null = null;
-    if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
+    const deadSessionCircuitBreaker = detectDeadReusedSessionCircuitBreaker({
+      sessionId,
+      runs,
+    });
+    let reason: string | null = deadSessionCircuitBreaker.reason;
+    let previousRunId = deadSessionCircuitBreaker.previousRunId ?? latestRun?.id ?? null;
+    if (!reason && hasPolicyThresholds && policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
+      !reason &&
+      hasPolicyThresholds &&
       policy.maxRawInputTokens > 0 &&
       latestRawUsage &&
       latestRawUsage.inputTokens >= policy.maxRawInputTokens
@@ -3538,7 +3590,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reason =
         `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
         `(threshold ${formatCount(policy.maxRawInputTokens)})`;
-    } else if (policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
+    } else if (!reason && hasPolicyThresholds && policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
       reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
     }
 
@@ -3547,7 +3599,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         rotate: false,
         reason: null,
         handoffMarkdown: null,
-        previousRunId: latestRun?.id ?? null,
+        previousRunId,
       };
     }
 
@@ -3584,7 +3636,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       rotate: true,
       reason,
       handoffMarkdown,
-      previousRunId: latestRun.id,
+      previousRunId,
     };
   }
 
